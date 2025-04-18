@@ -6,10 +6,19 @@ from debugger_api import Debugger, Target, Symbol, ProcessState, SymbolType
 from enum import IntEnum
 from enum import IntEnum
 
+def _canonical_typename(var):
+    return var.GetType().GetCanonicalType().GetDisplayTypeName()
+
 class LLDBSymbol(Symbol):
 
     def __init__(self, var: lldb.SBValue):
         self._var = var
+
+    def _canonical_type(self):
+        return self._var.GetType().GetCanonicalType()
+
+    def _canonical_typename(self) -> str:
+        return self._canonical_type().GetDisplayTypeName()
 
     def name(self) -> str:
         return self._var.name
@@ -18,26 +27,104 @@ class LLDBSymbol(Symbol):
         """
         Returns the type of this symbol.
         """
-        can_type = self._var.GetType().GetCanonicalType()
+
+        # get the canonical type (stripping off typedefs).
+        can_type = self._canonical_type()
+
+        # check for pointers ...
         if can_type.IsPointerType():
             return SymbolType.POINTER
+        # check for arrays ...
         elif can_type.IsArrayType():
-            return SymbolType.ARRAY
+            # for arrays, check for potential strings ...
+            obj = self._cast_string()
+            if isinstance(obj, str):
+                return SymbolType.STRING
+            else:
+                return SymbolType.ARRAY
+        # check of structures and unions ...
         elif can_type.IsAggregateType():
             return SymbolType.STRUCT
+        # check for enumerations ...
+        elif can_type.GetTypeClass() == lldb.eTypeClassEnumeration:
+            return SymbolType.ENUM
         else:
             return SymbolType.BASIC
+    
+    def _cast_string(self) -> Optional[str]:
+        """
+        Attempts to cast the current variable as a string. Returns the string
+        if it succeeds or None if it fails.
 
-    def value(self) -> Union[str, int, float]: 
+        The following are candidates considered for C-strings.
+        - "char" or "const char" arrays.
+        - "const char *" types.
+
+        They must contain printable characters and must be NULL terminated.
+        """
+        can_type = self._canonical_type()
+        if (
+                can_type.IsArrayType() and 
+                _canonical_typename(self._var.GetChildAtIndex(0)) == "char" 
+        ):
+            # Get the character array as a string
+            error = lldb.SBError()
+            char_array = self._var.GetData()
+            length = self._var.GetNumChildren()
+
+            # Read the data into a byte array
+            byte_data = char_array.ReadRawData(error, 0, length)
+            if not error.Success():
+                raise RuntimeError(f"Failed to read data: {error.GetCString()}")
+
+            # convert to characters if possible
+            chars = []
+            for b in byte_data:
+                if 33 <= b <= 127:
+                    chars.append(chr(b))
+                elif b == 0:
+                    break
+                else:
+                    return None
+            
+            return ''.join(chars)
+
+        return None
+
+    def value_string(self) -> str:
+        """
+        For a string type, returns the value a string. For an enumeration,
+        returns the enum name as a string.
+        
+        :return The string representation of the symbol.
+        """
+
+        if self.type() == SymbolType.STRING:
+            obj = self._cast_string()
+            assert isinstance(obj, str)
+            return obj
+        elif self.type() == SymbolType.ENUM:
+            return self._var.GetValue()
+
+        assert False
+
+    def value_number(self) -> Union[int, float]: 
         """
         For a basic or pointer symbol, returns its value. For a pointer, the
         value is the address held by the pointer symbol.
 
-        :return The value of the symbol.
+        :return The integer or float representation of the symbol.
         """
+
+        # handle enums.
+        if self.type() == SymbolType.ENUM:
+            return self._var.GetValueAsUnsigned()
+
+        # handle pointers.
         if self.type() == SymbolType.POINTER:
             return int(self._var.GetValue(), 0)
 
+        # handle basic integer and float types ...
         assert self.type() == SymbolType.BASIC
 
         # these are integer types.
@@ -249,3 +336,14 @@ class LLDB(Debugger):
 
     def targets(self) -> List[Target]:
         return list(self._targets.values())
+
+if __name__ == "__main__":
+
+    dbg = LLDB()
+    target = dbg.create_target_from_file("example", "example")
+    target.set_breakpoint_by_label("displayAllStudents")
+    state = target.launch_process()
+    print(f'Process exited with state {repr(state)}.')
+    var = target.get_global('db')
+    IPython.embed()
+

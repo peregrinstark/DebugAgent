@@ -22,9 +22,7 @@ class SymbolInfo(BaseModel):
     symbols.
 
     Each symbol has a unique UUID identifier which can be used to uniquely
-    refer to this symbol.
-
-    Symbols can be of the following types:
+    refer to this symbol, and a type that is described below:
 
     - Structure Symbols for which type is "structure" contains members (which
       are in turn of Symbol type) indexed by name. Members can be retrieved by
@@ -33,21 +31,25 @@ class SymbolInfo(BaseModel):
       indexed using integers. The total number of indices can be retrived by
       using the get_num_indices() tool and a Symbol at a specific index can be
       retrieved using get_index() tool.
+    - String Synbols for which type is "string" contains string values which
+      can be retrieved using get_value_string().
     - Basic Symbols for which type is "basic" contains basic values such as
-      integers or strings. The type of the data held by a basic variable can be
-      queried using get_basic_symbol_type() tool which returns either
-      "integer", or "string", and the value can be retrieved using the tool
-      get_value().
+      integers or floating point values. Their value can be retrieved using
+      get_value_number().
     - Pointer Symbols, which contain an address of another Symbol. The address
-      can be retrieved using get_value().
+      can be retrieved using get_value_number().
+    - Enum Symbols, which represent an enumeration. You can retrieve the enum
+      name using get_value_string() and the enum value (an unsigned integer)
+      using get_value_number(). Enums contain both a name and value and is
+      typically represented as "name(value").
 
-    Each Symbol has a recursive tree like structure that terminates at a basic
-    symbol or a pointer. When the user asks to display a symbol, traverse the
-    Symbol and print it using a tree format.
+    Each symbol that isn't one of "basic", "enum" or "pointer" can be traversed
+    recursively. Structures can be traversed by enumerating its members and
+    Arrays can be traversed by enumerating its indices. 
     """
     id: uuid.UUID = Field(..., description="Unique identifier for this symbol")
     name: str = Field(..., description="Name of the symbol.")
-    type: Literal['basic', 'structure', 'array', 'pointer']
+    type: Literal['basic', 'structure', 'array', 'pointer', 'string', 'enum']
 
 class TargetInfo(BaseModel):
     """
@@ -226,14 +228,14 @@ get_array_size_tool = StructuredTool.from_function(
         handle_tool_error=True
         )
 
-def get_value(sym: SymbolInfo) -> Union[int, str, float]:
+def get_value_string(sym: SymbolInfo) -> str:
     """
-    Given a basic or pointer symbol, returns the value of the symbol which can
-    either be an integer, string or a float value. For pointer symbols, the
-    value returned is the address held by the pointer symbol.
+    For symbols with type "string" returns the value of the symbol as a string.
+
+    For symbols with type "enum" returns the enum name as a string.
 
     Args:
-        sym: A basic or pointer symbol.
+        sym: A basic or pointer or enum type symbol.
 
     Returns:
         The value of the symbol.
@@ -241,13 +243,41 @@ def get_value(sym: SymbolInfo) -> Union[int, str, float]:
     var = debugger.symbols[sym.id]
 
     # return the value for valid symbol types.
-    if var.type() == SymbolType.BASIC or var.type() == SymbolType.POINTER:
-        return var.value()
+    if var.type() in { SymbolType.STRING, SymbolType.ENUM }:
+        return var.value_string()
 
-    raise ToolException(f'Only basic or pointer variables have a value. {sym.name} is not a basic variable!')
+    raise ToolException(f'Only string and enumerations have a value_string parameter')
 
-get_value_tool = StructuredTool.from_function(
-        func=get_value,
+get_value_string_tool = StructuredTool.from_function(
+        func=get_value_string,
+        handle_tool_error=True
+        )
+
+def get_value_number(sym: SymbolInfo) -> Union[int, float]:
+    """
+    For a symbol with type "basic" or "pointer", returns the value of the
+    symbol which can either be an integer or a float value. For pointer
+    symbols, the value returned is the address held by the pointer symbol.
+
+    For a symbol with type "enum", returns the integer representation of the
+    enum as an unsigned int.
+
+    Args:
+        sym: A basic or pointer or enum type symbol.
+
+    Returns:
+        The value of the symbol.
+    """
+    var = debugger.symbols[sym.id]
+
+    # return the value for valid symbol types.
+    if var.type() in { SymbolType.BASIC, SymbolType.POINTER, SymbolType.ENUM }:
+        return var.value_number()
+
+    raise ToolException(f'Only basic/pointer/enum variables have a value. {sym.name} does not have basic value!')
+
+get_value_number_tool = StructuredTool.from_function(
+        func=get_value_number,
         handle_tool_error=True
         )
 
@@ -255,6 +285,13 @@ get_value_tool = StructuredTool.from_function(
 SYSTEM_MESSAGE = SystemMessage("""
 You are an intelligent assistant designed to help users debug their programs. 
 Invoke one of the provided tools by interpreting the user command.
+
+When a user requests you to get a global variable, assume C-notation. For
+example, if the request is for "var.member1[10].member2", it means get the
+global variable "var" as a Symbol using get_global(), and traverse it using the
+provided tools (get_member, get_index etc.,) until you reach the desired
+Symbol.
+
 """)
 
 def model(state: MessagesState):
@@ -275,7 +312,8 @@ class LLDBAgent:
                 get_members_tool,
                 get_array_size_tool,
                 get_index_tool,
-                get_value_tool
+                get_value_number_tool,
+                get_value_string_tool
                 ]
 
         # create a model and bind the tools.
@@ -348,7 +386,7 @@ agent = LLDBAgent()
 if __name__ == "__main__":
 
     # run some initial commands.
-    agent.do("Create a new target called calc with the executable ../calc/calc")
+    agent.do("Create a new target called example with the executable example")
     agent.do("Set a breakpoint on printf")
     agent.do("Run the program")
 

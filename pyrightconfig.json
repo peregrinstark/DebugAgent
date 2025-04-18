@@ -1,0 +1,8 @@
+{
+  "include": ["."],
+  "settings": {
+    "extraPaths": [
+      ".",
+      "/Users/vijayr/Documents/General/Personal/Vijay/git/llvm-project/build/lib/python3.10/site-packages"
+    ]
+}

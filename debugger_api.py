@@ -11,6 +11,8 @@ class SymbolType(Enum):
     STRUCT="structure"
     ARRAY="array"
     POINTER="pointer"
+    STRING="string"
+    ENUM="enum"
 
 class Symbol(ABC):
     """
@@ -30,6 +32,9 @@ class Symbol(ABC):
     - Basic Symbols for which is_basic() returns True which contains neither
       members or elements. They hold either integers or strings that can be
       retrieved by calling the value() API.
+    - String Symbols for which is_string() returns True which contains a
+      string. For C-variables, this means either char arrays or const char *
+      pointers that contain a NULL terminated and printable string.
 
     Each Symbol has a tree like structure that terminates in a basic symbol.
     """
@@ -70,12 +75,47 @@ class Symbol(ABC):
         """
         return self.type() == SymbolType.POINTER
 
-    @abstractmethod 
-    def value(self) -> Union[str,int,float]: 
+    def is_string(self) -> bool:
         """
-        For a basic symbol (is_basic() is True), returns the value of the symbol. 
+        Checks if this symbol is a string symbol. 
+
+        :return True if the symbol is a string type.
+        """
+        return self.type() == SymbolType.STRING
+
+    def is_enum(self) -> bool:
+        """
+        Check is this symbol is a enumeration.
+
+        :return True if the symbol is an enumeration type.
+        """
+        return self.type() == SymbolType.ENUM
+
+    @abstractmethod 
+    def value_number(self) -> Union[int,float]: 
+        """
+        For a basic symbol (is_basic is True), returns the value of the symbol
+        which is either an integer or floating point value.
+
+        For a enum synbol (is_enum is True), returns the integer value of the
+        enumeration.
+
+        For a pointer symbol (is_pointer is True), returns the integer value of
+        the pointer.
 
         :return The value of a basic symbol.
+        """
+
+    @abstractmethod
+    def value_string(self) -> str:
+        """
+        For a string symbol (is_string is True), returns the string value of
+        the symbol.
+
+        For a enumeration (is_enum is True), returns the string value of the
+        enumeration.
+
+        :return The string reprsentation of the string or enumeration symbol.
         """
 
     @abstractmethod 
