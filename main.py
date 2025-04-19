@@ -1,9 +1,11 @@
 import sys
+import logging
 
 import IPython
+
 from lldb_wrapper import LLDB
-from debugger_api import ProcessState, Symbol, SymbolType
-from typing import List, Tuple, Literal, Any, Dict, Union
+from debugger_api import ProcessState, Symbol, SymbolType, SymbolNotFound
+from typing import List, Tuple, Literal, Any, Dict, Union, Optional
 from pydantic import BaseModel, Field
 from langchain_openai import ChatOpenAI
 from langchain_core.tools import tool, StructuredTool, ToolException
@@ -11,9 +13,90 @@ from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import MessagesState
 from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.graph import START, StateGraph
-from langgraph.prebuilt import tools_condition, ToolNode, create_react_agent
+from langgraph.prebuilt import create_react_agent
 import uuid
 
+HIERARCHY_REQUEST = """
+If the user requests a variable of the form
+"var.member1.member2[<idx>].member3", where <idx> is a number, parse it using a
+C-variable notation and get the value by traversing recursively as follows
+(using the above example):
+
+1. v = get_global(target, "var2")
+2. v = get_member(target, v, "member1")
+3. v = get_member(target, v, "member2")
+3. v = get_index(target, v, <idx>)
+    - You can optionally check if the <idx> is in range by comparing it with
+      the value returned by get_array_size(target, v)
+4. v = get_member(target, v, "member3")
+
+Allow wildcards for <idx>. For example, if the user uses "*" for index, apply
+the request for all elements of the corresponding array (whose size is
+determined using get_array_size).
+
+You can also allow ranges (ex: 1-10)for <idx>. In that case, you should
+retrieve the array indices corresponding to the user provided range.
+
+"""
+
+# message for the AI tool.
+SYSTEM_MESSAGE = SystemMessage(
+f"""
+You are an intelligent assistant designed to help users debug their programs.
+As a debugger you have access to a collection of targets indexed by name that
+can be retrieved using the get_target() tool. 
+
+Each target has a collection of variables (also called Symbols) that can be
+retrieved on user request via the get_global() tool. Note that the get_global
+only takes a C style identifier as an input.
+
+Each variable (also known as a "Symbol") can be thought of as a C style
+variable that can either be one of:
+
+- Structures
+- Unions
+- Arrays
+- Enums
+- Strings (char arrays or const char *)
+- Basic Types (such as integers and floating point values).
+
+Each symbol has a type entry that indicates one of the above types. Structures,
+Unions and Arrays are "aggregate" types that inturn contains collections of
+symbols while the rest are "scalar" types whose values can be retrieved using
+get_value_string() or get_value_number() as described below>
+
+Each symbol can be traversed using the following tools. The following functions
+work only on aggregate types (Structures, Unions, Arrays).
+
+- get_member() returns a symbol that represents the member of a structure
+  variable. Obviously, this only works for structure variables.
+- get_members() returns all the members of a structure variable.
+- get_array_size() returns the size of an array variable.
+- get_index() returs a symbol at the specified index of an array variable.
+
+These functions work only on "scalar" types (Strings, Enums, Basic types):
+
+- get_value_number() returns the value as an integer or floating point number
+  for a basic integer or floating point symbol. It also returns the integer
+  value of a enum variable.
+- get_value_string() returns the value of a string Symbol type (char arrays or
+  const char *). It also returns the name of a enum symbol.
+
+When the user requests a value, use get_value_number of get_value_string to
+retrieve the value for "Scalar" types, but tell the user that you cannot
+retrieve a value for "Aggregate" types.
+
+Only call functions that are appropriate to be called. For example,
+get_members() is only appropriate if the corresponding Symbol is a structure
+type. Do not call get_value_*() functions on aggregate types.
+
+{HIERARCHY_REQUEST}
+
+If the user requests to print an aggregate type, try to traverse the aggregate
+type by invoking get_member(), get_index() etc., and print it C-sytel structure
+notation.
+
+""")
 class SymbolInfo(BaseModel):
     """
     Represents a symbol in a C-like program which contains either a basic
@@ -63,6 +146,9 @@ class Application:
     def __init__(self):
         self.lldb = LLDB()
         self.symbols: Dict[uuid.UUID, Symbol]  = {}
+
+    def get_symbol(self, info: SymbolInfo):
+        return self.symbols.get(info.id)
 
     def add_symbol(self, sym: Symbol) -> SymbolInfo:
         id = uuid.uuid4()
@@ -115,7 +201,6 @@ def launch_process(target: TargetInfo) -> str:
         return _target.get_backtrace()
     return "The process was successfully launched."
 
-@tool(parse_docstring=True)
 def get_global(target: TargetInfo, name: str) -> SymbolInfo:
     """
     Returns a global variable read from the target. A variable is a Symbol with
@@ -123,17 +208,59 @@ def get_global(target: TargetInfo, name: str) -> SymbolInfo:
 
     Args:
         target: Name of the target to read variable from.
-        name: Name of the global variable to fetch.
+        name: Name of the global variable to fetch. Should be a C-style
+        identifier without any special case characters.
 
     Returns:
         A Symbol
     """
+    # check if the name contains special characters.
+    spl_chars = any(name.find(c) > 0 for c in '[].')
+    if spl_chars:
+        raise ToolException(f"""
+The provided name argument must not contain special
+characters. If the user passed a C-style string, parse and
+handle it recursively. {HIERARCHY_REQUEST}.
+                """)
+
     # get the target.
     _target = debugger.lldb.target(target.name)
-    # get the variable from the target.
-    var = _target.get_global(name)
+    try:
+        # get the variable from the target.
+        var = _target.get_global(name)
+    except SymbolNotFound:
+        raise ToolException(f"""
+A symbol with the specified name {name} was not found. Can you please
+check if you are parsing the user request correctly? {HIERARCHY_REQUEST}
+        """)
     # append this object with a unique UUID to our application database.
     return debugger.add_symbol(var)
+
+get_global_tool = StructuredTool.from_function(
+        func=get_global,
+        handle_tool_error=True
+        )
+
+@tool(parse_docstring=True)
+def get_targets() -> List[TargetInfo]:
+    """
+    Gets all targets available in the debugger.
+
+    Returns:
+        List of all targets available in the debugger.
+    """
+    targets = []
+    for name, _ in debugger.lldb.targets().items():
+        targets.append(TargetInfo(name=name))
+    return targets
+
+ERR_REROUTE_STR = {
+        SymbolType.ARRAY: 'Use get_index(...) or get_array_size(...) instead since it of type array',
+        SymbolType.BASIC: 'Use get_value_number(...) instead since it of type basic',
+        SymbolType.ENUM: 'Use get_value_string(...) instead since it of type enum',
+        SymbolType.STRING: 'Use get_value_string(...) instead since it of type string',
+        SymbolType.STRUCT: 'Use get_member(...) instead since it of type string',
+}
 
 def get_member(sym: SymbolInfo, name: str) -> SymbolInfo:
     """
@@ -148,9 +275,19 @@ def get_member(sym: SymbolInfo, name: str) -> SymbolInfo:
         A Symbol that contains the member with the specified name within the
         specified Struct Symbol.
     """
-    var = debugger.symbols[sym.id]
+    var = debugger.get_symbol(sym)
+    if var is None:
+        raise ToolException(f"""
+        The symbol with this id {sym.id} is not found!
+        """)
+    if var.name() != sym.name:
+        raise ToolException(f"""
+        The name of the symbol {sym.name} passed does not match its id {sym.id}!
+        """)
     if var.type() != SymbolType.STRUCT:
-        raise ToolException(f'{sym.name} is not a structure type. It does not have members!')
+        raise ToolException(f"""
+        {sym.name} is of type {var.type()} and does not have members. {ERR_REROUTE_STR[var.type()]}.
+        """)
     memb = var.member(name)
     return debugger.add_symbol(memb)
 
@@ -172,7 +309,9 @@ def get_members(sym: SymbolInfo) -> List[SymbolInfo]:
     """
     var = debugger.symbols[sym.id]
     if var.type() != SymbolType.STRUCT:
-        raise ToolException('{sym.name} is not a structure type. It does not have members!')
+        raise ToolException(f"""
+        {sym.name} is of type {var.type()} and does not have members. {ERR_REROUTE_STR[var.type()]}.
+        """)
     syms = []
     for m in var.members():
         syms.append(debugger.add_symbol(m))
@@ -198,7 +337,9 @@ def get_index(sym: SymbolInfo, index: int) -> SymbolInfo:
     """
     var = debugger.symbols[sym.id]
     if var.type() != SymbolType.ARRAY:
-        raise ToolException(f'get_index(...) only works on array type symbols!')
+        raise ToolException(f"""
+        {sym.name} is not an array. {ERR_REROUTE_STR[var.type()]}.
+        """)
     idx_var = var.index(index)
     return debugger.add_symbol(idx_var)
 
@@ -220,7 +361,9 @@ def get_array_size(sym: SymbolInfo) -> int:
     """
     var = debugger.symbols[sym.id]
     if var.type() != SymbolType.ARRAY:
-        raise ToolException(f'get_array_size() only works on array type symbols!')
+        raise ToolException(f"""
+        {sym.name} is not array. {ERR_REROUTE_STR[var.type()]}.
+        """)
     return var.num_indices()
 
 get_array_size_tool = StructuredTool.from_function(
@@ -228,9 +371,11 @@ get_array_size_tool = StructuredTool.from_function(
         handle_tool_error=True
         )
 
-def get_value_string(sym: SymbolInfo) -> str:
+def get_value_string(sym: SymbolInfo) -> Optional[str]:
     """
     For symbols with type "string" returns the value of the symbol as a string.
+    It could potentially be an empty string. Do not hallucinate and try to
+    coerce it with a valid string.
 
     For symbols with type "enum" returns the enum name as a string.
 
@@ -238,15 +383,23 @@ def get_value_string(sym: SymbolInfo) -> str:
         sym: A basic or pointer or enum type symbol.
 
     Returns:
-        The value of the symbol.
+        The value of the symbol as a string. It could potentially be empty.
+        Indicate it accordingly if so.
     """
     var = debugger.symbols[sym.id]
 
     # return the value for valid symbol types.
     if var.type() in { SymbolType.STRING, SymbolType.ENUM }:
-        return var.value_string()
+        out = var.value_string()
+        if len(out) == 0:
+            return None 
+        else:
+            return out
 
-    raise ToolException(f'Only string and enumerations have a value_string parameter')
+    raise ToolException(f"""
+    get_value_string() only works on String and Enum types, but
+    {sym.name} is of type {var.type()}! {ERR_REROUTE_STR[var.type()]}.
+    """)
 
 get_value_string_tool = StructuredTool.from_function(
         func=get_value_string,
@@ -274,25 +427,16 @@ def get_value_number(sym: SymbolInfo) -> Union[int, float]:
     if var.type() in { SymbolType.BASIC, SymbolType.POINTER, SymbolType.ENUM }:
         return var.value_number()
 
-    raise ToolException(f'Only basic/pointer/enum variables have a value. {sym.name} does not have basic value!')
+    raise ToolException(f"""
+    get_value_number() only works on Basic, Pointer and Enum types, but
+    {sym.name} is of type {var.type()}!
+    """)
 
 get_value_number_tool = StructuredTool.from_function(
         func=get_value_number,
         handle_tool_error=True
         )
 
-# message for the AI tool.
-SYSTEM_MESSAGE = SystemMessage("""
-You are an intelligent assistant designed to help users debug their programs. 
-Invoke one of the provided tools by interpreting the user command.
-
-When a user requests you to get a global variable, assume C-notation. For
-example, if the request is for "var.member1[10].member2", it means get the
-global variable "var" as a Symbol using get_global(), and traverse it using the
-provided tools (get_member, get_index etc.,) until you reach the desired
-Symbol.
-
-""")
 
 def model(state: MessagesState):
     return {"messages": [agent.model.invoke([SYSTEM_MESSAGE] + state["messages"])]}
@@ -304,10 +448,11 @@ class LLDBAgent:
 
         # collect the set of tools available.
         self.tools = [
-                create_target_from_file, 
-                set_breakpoint_from_label,
-                launch_process,
-                get_global,
+                # create_target_from_file, 
+                # set_breakpoint_from_label,
+                # launch_process,
+                get_targets,
+                get_global_tool,
                 get_member_tool,
                 get_members_tool,
                 get_array_size_tool,
@@ -332,7 +477,8 @@ class LLDBAgent:
                   "configurable": { 
                                    "thread_id": thread_id 
                                    },
-                  "recursion_limit": 20
+                  "max_concurrency": 1,
+                  "recursion_limit": 30,
                  }
 
     def build_graph(self):
@@ -361,6 +507,7 @@ class LLDBAgent:
         self.react = create_react_agent(
                 model = self.model,
                 tools = self.tools,
+                prompt = SYSTEM_MESSAGE,
                 checkpointer=self.memory
                 )
 
@@ -374,22 +521,26 @@ class LLDBAgent:
         elif self.react:
             inputs = {"messages": [("user", msg)]}
             stream = self.react.stream(inputs, stream_mode="values", config=self.config)
+            msg_count = 0
             for s in stream:
-                message = s["messages"][-1]
-                if isinstance(message, tuple):
-                    print(message)
-                else:
-                    message.pretty_print()
-        
-agent = LLDBAgent()
+                for count in range(msg_count, len(s['messages'])):
+                    message = s['messages'][count]
+                    # if message.type == 'tool':
+                    #    import pdb; pdb.set_trace()
+                    if isinstance(message, tuple):
+                        print(message)
+                    else:
+                        message.pretty_print()
+                msg_count = len(s['messages'])
 
 if __name__ == "__main__":
 
-    # run some initial commands.
-    agent.do("Create a new target called example with the executable example")
-    agent.do("Set a breakpoint on printf")
-    agent.do("Run the program")
+    # prepare the target.
+    target = debugger.lldb.create_target_from_file("example", "example")
+    target.set_breakpoint_by_label('printf')
+    status = target.launch_process()
+    print(f'Target stopped at {repr(status)}')
 
+    # create the agent.
+    agent = LLDBAgent()
     IPython.embed()
-
-

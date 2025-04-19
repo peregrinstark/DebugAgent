@@ -39,7 +39,7 @@ Database db = { .student_count = 0 };
 // Main function
 int main() {
     // Add 10 students
-    addStudent(&db, 1, "Alice", GRADE_A);
+    addStudent(&db, 1, "Allison", GRADE_A);
     addStudent(&db, 2, "Bob", GRADE_B);
     addStudent(&db, 3, "Charlie", GRADE_C);
     addStudent(&db, 4, "Diana", GRADE_A);

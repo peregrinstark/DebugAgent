@@ -2,7 +2,7 @@ from typing import List, Dict, Optional, Union
 import pdb
 import IPython
 import lldb
-from debugger_api import Debugger, Target, Symbol, ProcessState, SymbolType
+from debugger_api import Debugger, Target, Symbol, ProcessState, SymbolType, SymbolNotFound
 from enum import IntEnum
 from enum import IntEnum
 
@@ -302,7 +302,10 @@ class LLDBTarget(Target):
 
     def get_global(self, name: str) -> LLDBSymbol:
         var = self._target.FindFirstGlobalVariable(name)
-        return LLDBSymbol(var)
+        if var.IsValid():
+            return LLDBSymbol(var)
+        else:
+            raise SymbolNotFound(f'A symbol with name {name} was not found on this target.')
 
     def get_backtrace(self):
         frames = []
@@ -323,7 +326,7 @@ class LLDB(Debugger):
     def __init__(self):
         self.debugger = lldb.SBDebugger.Create()
         self.debugger.SetAsync(False)
-        self._targets: Dict[str, LLDBTarget] = {}
+        self._targets: Dict[str, Target] = {}
     
     def create_target_from_file(self, name, file_path) -> LLDBTarget:
         lldb_target = self.debugger.CreateTargetWithFileAndArch(file_path, lldb.LLDB_ARCH_DEFAULT)
@@ -331,11 +334,11 @@ class LLDB(Debugger):
         self._targets[name] = _target
         return _target
     
-    def target(self, name: str):
+    def target(self, name: str) -> Target:
         return self._targets[name]
 
-    def targets(self) -> List[Target]:
-        return list(self._targets.values())
+    def targets(self) -> Dict[str, Target]:
+        return self._targets
 
 if __name__ == "__main__":
 

@@ -1,6 +1,6 @@
 from __future__ import annotations
 from abc import abstractmethod, ABC 
-from typing import List, Union
+from typing import List, Union, Dict
 from enum import Enum, IntEnum
 
 class SymbolType(Enum):
@@ -13,6 +13,9 @@ class SymbolType(Enum):
     POINTER="pointer"
     STRING="string"
     ENUM="enum"
+
+class SymbolNotFound(RuntimeError):
+    pass
 
 class Symbol(ABC):
     """
@@ -222,6 +225,9 @@ class Target(ABC):
         """
         Returns the global symbol with the given name.
 
+        Raises SymbolNotFound if a global symbol with the corresponding name is
+        not found.
+
         :return Returns the symbol with the given name.
         """
 
@@ -233,9 +239,10 @@ class Debugger(ABC):
     """
 
     @abstractmethod
-    def targets(self) -> List[Target]:
+    def targets(self) -> Dict[str, Target]:
         """
-        Returns the list of all targets in this crash dump.
+        Returns all targets in the Debugger as a key-value dictionary indexed
+        by name.
 
         :return A list of targets contained in this Debugger.
         """
